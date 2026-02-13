@@ -135,9 +135,9 @@ jobs:
             echo "⚠ File type may not be a standard ISO: $ISO_TYPE"
           fi
 
-          # Verify minimum size (a real kernel ISO should be at least 5MB)
-          if [ "$ISO_SIZE" -lt 5000000 ]; then
-            echo "⚠ ISO is suspiciously small ($ISO_SIZE bytes)"
+          # Verify minimum size (a real ISO with rootfs should be at least 200MB)
+          if [ "$ISO_SIZE" -lt 200000000 ]; then
+            echo "⚠ ISO is suspiciously small ($ISO_SIZE bytes) — may be missing rootfs"
           else
             echo "✓ ISO size looks reasonable ($ISO_SIZE bytes)"
           fi

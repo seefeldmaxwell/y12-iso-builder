@@ -762,6 +762,14 @@ async function runBuildValidation(manifest: any, kernelConfig: string, buildScri
   const hasGrub = dockerfile.includes('grub') || dockerfile.includes('xorriso');
   results.push({ name: 'dockerfile_bootloader', pass: hasGrub, msg: hasGrub ? 'Bootloader/ISO step present' : 'Missing bootloader step' });
 
+  // 15b. Dockerfile: has debootstrap rootfs
+  const hasDebootstrap = dockerfile.includes('debootstrap');
+  results.push({ name: 'dockerfile_rootfs', pass: hasDebootstrap, msg: hasDebootstrap ? 'Real rootfs via debootstrap' : 'Missing debootstrap rootfs' });
+
+  // 15c. Dockerfile: has squashfs
+  const hasSquashfs = dockerfile.includes('mksquashfs');
+  results.push({ name: 'dockerfile_squashfs', pass: hasSquashfs, msg: hasSquashfs ? 'Squashfs live filesystem present' : 'Missing squashfs step' });
+
   // 16. Package resolution: all overlay packages resolved
   const pkgMgr = manifest.pkgManager;
   const pkgMap = OVERLAY_PACKAGES[pkgMgr] || {};
@@ -795,64 +803,104 @@ async function runBuildValidation(manifest: any, kernelConfig: string, buildScri
 // ── Dockerfile generator ──────────────────────────────────────────────
 
 function generateDockerfile(manifest: any, kernelConfig: string): string {
-  // Always use debian:12 as the BUILD container — it has all the tools.
-  // The target distro affects the rootfs packages, not the build environment.
+  // Always use debian:12 as the BUILD container.
+  // Build a real live ISO with debootstrap rootfs + squashfs + custom kernel.
+  const allPkgs = [...(manifest.packages || []), ...(manifest.customSoftware || [])];
+
+  // Base packages every rootfs needs for a bootable, usable system
+  const basePkgs = [
+    'systemd', 'systemd-sysv', 'udev', 'dbus',
+    'iproute2', 'iputils-ping', 'net-tools', 'wget', 'curl', 'ca-certificates',
+    'openssh-server', 'sudo', 'bash', 'vim-tiny', 'less',
+    'linux-firmware',
+    'kmod', 'pciutils', 'usbutils', 'lsof', 'procps',
+    'locales', 'console-setup', 'keyboard-configuration',
+  ];
+
+  if (manifest.mode === 'server') {
+    basePkgs.push('iptables', 'nftables', 'cron', 'logrotate', 'htop');
+  } else {
+    basePkgs.push(
+      'xorg', 'xinit', 'openbox', 'lightdm', 'pulseaudio',
+      'network-manager', 'firefox-esr', 'xterm',
+    );
+  }
+
+  const overlayPkgStr = allPkgs.length > 0 ? ` ${allPkgs.join(' ')}` : '';
+
   const lines = [
     'FROM debian:12 AS builder',
     '',
-    '# Build dependencies (same for all target distros)',
+    '# Build + ISO tools',
     'RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\',
     '    build-essential libncurses-dev bison flex libssl-dev libelf-dev \\',
     '    bc git wget cpio kmod xorriso grub-pc-bin grub-efi-amd64-bin grub-common \\',
-    '    mtools dosfstools squashfs-tools ca-certificates debootstrap \\',
+    '    mtools dosfstools squashfs-tools ca-certificates debootstrap live-boot \\',
     '    && rm -rf /var/lib/apt/lists/*',
     '',
+    '# ── Stage 1: Build custom kernel ──────────────────────────────────',
     '# Clone kernel source (v6.6 LTS) with retry for transient mirror failures',
     'RUN for i in 1 2 3; do git clone --depth 1 --branch v6.6 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git /usr/src/linux && break || sleep 10; done',
     '',
-    '# Start from x86_64 defconfig (includes real hardware drivers: NVMe, AHCI, USB, NIC, GPU, etc)',
-    '# Then layer the Y12 AI-generated config on top for hardware-specific customization',
+    '# defconfig = real hardware support (NVMe, AHCI, USB, NIC, GPU, etc)',
+    '# Then merge Y12 AI-generated hardware-specific config on top',
     'RUN cd /usr/src/linux && make defconfig',
     'COPY kernel.config /tmp/y12.config',
     'RUN cd /usr/src/linux && scripts/kconfig/merge_config.sh .config /tmp/y12.config',
     '',
-    '# Compile kernel + modules (defconfig gives real hardware support)',
+    '# Compile kernel + modules',
     'RUN cd /usr/src/linux && make -j$(nproc) bzImage modules 2>&1 | tail -5',
     '',
-    '# Install kernel and modules into rootfs',
-    'RUN mkdir -p /rootfs/boot /rootfs/lib/modules',
-    'RUN cp /usr/src/linux/arch/x86/boot/bzImage /rootfs/boot/vmlinuz-y12',
+    '# ── Stage 2: Build real root filesystem via debootstrap ───────────',
+    'RUN debootstrap --variant=minbase --include=' + basePkgs.join(',') + ' bookworm /rootfs http://deb.debian.org/debian',
+    '',
+    '# Install custom kernel into rootfs',
+    'RUN cp /usr/src/linux/arch/x86/boot/bzImage /rootfs/boot/vmlinuz-6.6.0-y12',
     'RUN cd /usr/src/linux && make modules_install INSTALL_MOD_PATH=/rootfs',
     '',
   ];
 
-  // Install overlay packages into rootfs using apt (debian-based rootfs for all ISOs)
-  const allPkgs = [...(manifest.packages || []), ...(manifest.customSoftware || [])];
+  // Install overlay packages into the rootfs via chroot
   if (allPkgs.length > 0) {
     lines.push(
       '# Install overlay packages into rootfs',
-      `RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${allPkgs.join(' ')} || true`,
-      'RUN rm -rf /var/lib/apt/lists/*',
+      `RUN chroot /rootfs /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends${overlayPkgStr} || true && rm -rf /var/lib/apt/lists/*"`,
       '',
     );
   }
 
   lines.push(
-    '# Create ISO filesystem structure',
+    '# Configure the rootfs',
+    'RUN echo "y12" > /rootfs/etc/hostname',
+    `RUN echo "Y12 Custom Linux (${manifest.distro} ${manifest.mode})" > /rootfs/etc/y12-release`,
+    'RUN chroot /rootfs /bin/bash -c "echo root:y12 | chpasswd"',
+    'RUN chroot /rootfs /bin/bash -c "useradd -m -s /bin/bash -G sudo y12 && echo y12:y12 | chpasswd"',
+    'RUN echo "y12 ALL=(ALL) NOPASSWD:ALL" > /rootfs/etc/sudoers.d/y12',
+    '# Enable serial console + tty',
+    'RUN chroot /rootfs /bin/bash -c "systemctl enable getty@tty1.service || true"',
+    'RUN chroot /rootfs /bin/bash -c "systemctl enable ssh.service || true"',
+    '',
+    '# Generate initramfs inside rootfs',
+    'RUN chroot /rootfs /bin/bash -c "apt-get update && apt-get install -y --no-install-recommends initramfs-tools && update-initramfs -c -k 6.6.0-y12 && rm -rf /var/lib/apt/lists/*"',
+    '',
+    '# ── Stage 3: Assemble live ISO ───────────────────────────────────',
     'RUN mkdir -p /iso/boot/grub /iso/live',
-    'RUN cp /rootfs/boot/vmlinuz-y12 /iso/boot/vmlinuz',
     '',
-    '# Create initramfs with modules and rootfs',
-    'RUN cd /rootfs && find . | cpio -o -H newc | gzip > /iso/boot/initrd.gz',
+    '# Copy kernel + initramfs into ISO',
+    'RUN cp /rootfs/boot/vmlinuz-6.6.0-y12 /iso/boot/vmlinuz',
+    'RUN cp /rootfs/boot/initrd.img-6.6.0-y12 /iso/boot/initrd.img || (cd /rootfs && find . | cpio -o -H newc | gzip > /iso/boot/initrd.img)',
     '',
-    '# GRUB config for BIOS + EFI boot',
-    `RUN printf 'set timeout=5\\nset default=0\\n\\nmenuentry "Y12 Custom Linux (${manifest.distro} ${manifest.mode})" {\\n  linux /boot/vmlinuz root=/dev/ram0 console=tty0 console=ttyS0,115200\\n  initrd /boot/initrd.gz\\n}\\n' > /iso/boot/grub/grub.cfg`,
+    '# Create squashfs of the full root filesystem (this is what makes the ISO real)',
+    'RUN mksquashfs /rootfs /iso/live/filesystem.squashfs -comp xz -e boot',
+    '',
+    '# GRUB config — boots the live squashfs filesystem',
+    `RUN printf 'set timeout=5\\nset default=0\\n\\nmenuentry "Y12 Custom Linux (${manifest.distro} ${manifest.mode})" {\\n  linux /boot/vmlinuz boot=live toram quiet splash\\n  initrd /boot/initrd.img\\n}\\nmenuentry "Y12 Custom Linux (recovery)" {\\n  linux /boot/vmlinuz boot=live toram single\\n  initrd /boot/initrd.img\\n}\\n' > /iso/boot/grub/grub.cfg`,
     '',
     '# Build bootable ISO (BIOS + EFI)',
-    'RUN grub-mkrescue -o /output.iso /iso 2>/dev/null || xorriso -as mkisofs -R -J -b boot/grub/i386-pc/eltorito.img -no-emul-boot -boot-load-size 4 -boot-info-table -o /output.iso /iso',
+    'RUN grub-mkrescue -o /output.iso /iso 2>&1 | tail -5 || xorriso -as mkisofs -R -J -b boot/grub/i386-pc/eltorito.img -no-emul-boot -boot-load-size 4 -boot-info-table -o /output.iso /iso',
     '',
-    '# Checksum',
-    'RUN sha256sum /output.iso > /output.iso.sha256',
+    '# Checksum + size report',
+    'RUN sha256sum /output.iso > /output.iso.sha256 && ls -lh /output.iso',
     '',
     'CMD ["cat", "/output.iso"]',
   );
