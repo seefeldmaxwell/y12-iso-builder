@@ -106,9 +106,11 @@ jobs:
             esac
           done
 
-          # Extract ISO from the built image
-          docker run --rm -v "$(pwd)/output:/out" y12-iso-builder \
-            sh -c "cp /output.iso /out/output.iso && cp /output.iso.sha256 /out/output.iso.sha256" || true
+          # Extract ISO from the built image using docker create + docker cp
+          EXTRACT_ID=$(docker create y12-iso-builder)
+          docker cp "$EXTRACT_ID:/output.iso" output/output.iso || true
+          docker cp "$EXTRACT_ID:/output.iso.sha256" output/output.iso.sha256 || true
+          docker rm "$EXTRACT_ID"
 
           echo "--- Output files ---"
           ls -lh output/
