@@ -159,14 +159,30 @@ jobs:
           ISO_SHA=$(sha256sum output/output.iso | cut -d' ' -f1)
           ISO_SIZE=$(stat -c%s output/output.iso)
 
-          curl -X PUT "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/upload-iso" \
+          echo "Uploading ${ISO_SIZE} bytes to R2..."
+          UPLOAD_RESP=$(curl -s -w "\n%{http_code}" -X PUT "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/upload-iso" \
             -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
             -H "Content-Type: application/octet-stream" \
             -H "X-ISO-SHA256: $ISO_SHA" \
             -H "X-ISO-Size: $ISO_SIZE" \
-            --data-binary @output/output.iso
+            --data-binary @output/output.iso)
 
-          echo "ISO uploaded to R2"
+          HTTP_CODE=$(echo "$UPLOAD_RESP" | tail -1)
+          BODY=$(echo "$UPLOAD_RESP" | head -1)
+          echo "Upload response: HTTP $HTTP_CODE — $BODY"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "ERROR: ISO upload failed with HTTP $HTTP_CODE"
+            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+              -d "{\"status\": \"failed\", \"log\": \"ISO upload to R2 failed: HTTP ${HTTP_CODE} — ${BODY}\"}"
+            exit 1
+          fi
+
+          echo "ISO uploaded to R2 successfully"
+          # Wait for KV to propagate before reporting complete
+          sleep 2
 
       - name: Report complete
         if: success()

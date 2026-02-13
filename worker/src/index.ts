@@ -954,6 +954,19 @@ app.post('/api/build/:id/progress', async (c) => {
   if (log) job.logs.push(`[${new Date().toISOString()}] ${log}`);
   if (status) job.status = status;
 
+  // If this is a "complete" status update, check R2 for the ISO
+  // This handles the race condition where upload-iso wrote to R2 but KV was stale
+  if (status === 'complete' && !job.iso_uploaded) {
+    const isoObj = await c.env.ISO_STORAGE.head(`builds/${jobId}/output.iso`);
+    if (isoObj) {
+      job.iso_uploaded = true;
+      job.iso_size = isoObj.size;
+      job.iso_sha256 = isoObj.customMetadata?.sha256 || '';
+      job.iso_r2_key = `builds/${jobId}/output.iso`;
+      job.logs.push(`[${new Date().toISOString()}] ISO confirmed in R2: ${isoObj.size} bytes`);
+    }
+  }
+
   await c.env.BUILD_JOBS.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 86400 * 7 });
   return c.json({ ok: true });
 });
@@ -1020,23 +1033,38 @@ app.put('/api/build/:id/upload-iso', async (c) => {
   const isoSha = c.req.header('X-ISO-SHA256') || 'unknown';
   const isoSize = c.req.header('X-ISO-Size') || '0';
 
-  // Stream the ISO body directly to R2
-  const body = await c.req.arrayBuffer();
+  // Stream the request body directly to R2 (supports up to 5GB)
   const r2Key = `builds/${jobId}/output.iso`;
-  await c.env.ISO_STORAGE.put(r2Key, body, {
-    customMetadata: { sha256: isoSha, size: isoSize, uploaded: new Date().toISOString() },
-  });
+  const rawBody = c.req.raw.body;
+  if (!rawBody) {
+    return c.json({ error: 'No body provided' }, 400);
+  }
+
+  try {
+    await c.env.ISO_STORAGE.put(r2Key, rawBody, {
+      httpMetadata: { contentType: 'application/octet-stream' },
+      customMetadata: { sha256: isoSha, size: isoSize, uploaded: new Date().toISOString() },
+    });
+  } catch (e: any) {
+    return c.json({ error: `R2 upload failed: ${e.message}` }, 500);
+  }
+
+  // Verify the upload
+  const head = await c.env.ISO_STORAGE.head(r2Key);
+  if (!head) {
+    return c.json({ error: 'R2 upload verification failed — object not found after put' }, 500);
+  }
 
   // Update job with ISO info
   const job = JSON.parse(data);
   job.iso_uploaded = true;
-  job.iso_size = parseInt(isoSize);
+  job.iso_size = head.size;
   job.iso_sha256 = isoSha;
   job.iso_r2_key = r2Key;
-  job.logs.push(`[${new Date().toISOString()}] ISO uploaded to R2: ${isoSize} bytes, SHA256: ${isoSha}`);
+  job.logs.push(`[${new Date().toISOString()}] ISO uploaded to R2: ${head.size} bytes, SHA256: ${isoSha}`);
   await c.env.BUILD_JOBS.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 86400 * 7 });
 
-  return c.json({ ok: true, r2_key: r2Key, size: isoSize, sha256: isoSha });
+  return c.json({ ok: true, r2_key: r2Key, size: head.size, sha256: isoSha });
 });
 
 // ── Download completed ISO ────────────────────────────────────────────
@@ -1047,9 +1075,10 @@ app.get('/api/build/:id/iso', async (c) => {
   if (!data) return c.json({ error: 'Build not found' }, 404);
 
   const job = JSON.parse(data);
-  if (!job.iso_uploaded) return c.json({ error: 'ISO not yet available', status: job.status, progress: job.progress }, 400);
 
+  // Fallback: check R2 directly even if KV doesn't have iso_uploaded (race condition)
   const obj = await c.env.ISO_STORAGE.get(`builds/${jobId}/output.iso`);
+  if (!job.iso_uploaded && !obj) return c.json({ error: 'ISO not yet available', status: job.status, progress: job.progress }, 400);
   if (!obj) return c.json({ error: 'ISO not found in R2' }, 404);
 
   return new Response(obj.body, {
