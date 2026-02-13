@@ -6,16 +6,14 @@ on:
       job_id:
         description: 'Build job ID from the Y12 API'
         required: true
-        type: string
       api_url:
         description: 'Y12 API base URL'
-        required: true
-        type: string
+        required: false
         default: 'https://y12-api.seefeldmaxwell1.workers.dev'
 
 jobs:
   build-iso:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     steps:
