@@ -858,20 +858,22 @@ function generateDockerfile(manifest: any, kernelConfig: string): string {
     '# ── Stage 2: Build real root filesystem via debootstrap ───────────',
     'RUN debootstrap --variant=minbase --include=' + basePkgs.join(',') + ' bookworm /rootfs http://deb.debian.org/debian',
     '',
-    '# Install custom kernel into rootfs',
+    '# Install custom kernel + config into rootfs',
     'RUN cp /usr/src/linux/arch/x86/boot/bzImage /rootfs/boot/vmlinuz-6.6.0-y12',
+    'RUN cp /usr/src/linux/.config /rootfs/boot/config-6.6.0-y12',
     'RUN cd /usr/src/linux && make modules_install INSTALL_MOD_PATH=/rootfs',
     '',
-    '# Add non-free-firmware repo for linux-firmware (hardware drivers)',
+    '# Setup chroot networking + non-free-firmware repo',
+    'RUN cp /etc/resolv.conf /rootfs/etc/resolv.conf',
     'RUN echo "deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware" > /rootfs/etc/apt/sources.list',
     '',
   ];
 
   // Install linux-firmware + mode packages + overlay packages via chroot
-  const allChrootPkgs = ['linux-firmware', ...chrootPkgs].filter(p => p);
+  const allChrootPkgs = ['linux-firmware', 'zstd', ...chrootPkgs].filter(p => p);
   lines.push(
     '# Install firmware + mode-specific + overlay packages via chroot',
-    `RUN chroot /rootfs /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${allChrootPkgs.join(' ')} || true && rm -rf /var/lib/apt/lists/*"`,
+    `RUN chroot /rootfs /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${allChrootPkgs.join(' ')} && rm -rf /var/lib/apt/lists/*"`,
     '',
   );
 
