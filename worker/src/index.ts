@@ -807,26 +807,30 @@ function generateDockerfile(manifest: any, kernelConfig: string): string {
   // Build a real live ISO with debootstrap rootfs + squashfs + custom kernel.
   const allPkgs = [...(manifest.packages || []), ...(manifest.customSoftware || [])];
 
-  // Base packages every rootfs needs for a bootable, usable system
+  // Base packages for debootstrap --include (must all be in Debian main)
   const basePkgs = [
     'systemd', 'systemd-sysv', 'udev', 'dbus',
     'iproute2', 'iputils-ping', 'net-tools', 'wget', 'curl', 'ca-certificates',
     'openssh-server', 'sudo', 'bash', 'vim-tiny', 'less',
-    'linux-firmware',
     'kmod', 'pciutils', 'usbutils', 'lsof', 'procps',
     'locales', 'console-setup', 'keyboard-configuration',
+    'initramfs-tools',
   ];
 
+  // Mode-specific packages (installed via chroot after debootstrap)
+  const modePkgs: string[] = [];
   if (manifest.mode === 'server') {
-    basePkgs.push('iptables', 'nftables', 'cron', 'logrotate', 'htop');
+    modePkgs.push('iptables', 'nftables', 'cron', 'logrotate', 'htop');
   } else {
-    basePkgs.push(
+    modePkgs.push(
       'xorg', 'xinit', 'openbox', 'lightdm', 'pulseaudio',
       'network-manager', 'firefox-esr', 'xterm',
     );
   }
 
-  const overlayPkgStr = allPkgs.length > 0 ? ` ${allPkgs.join(' ')}` : '';
+  // Combine mode + overlay packages for chroot install
+  const chrootPkgs = [...modePkgs, ...allPkgs];
+  const chrootPkgStr = chrootPkgs.length > 0 ? chrootPkgs.join(' ') : '';
 
   const lines = [
     'FROM debian:12 AS builder',
@@ -835,7 +839,7 @@ function generateDockerfile(manifest: any, kernelConfig: string): string {
     'RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\',
     '    build-essential libncurses-dev bison flex libssl-dev libelf-dev \\',
     '    bc git wget cpio kmod xorriso grub-pc-bin grub-efi-amd64-bin grub-common \\',
-    '    mtools dosfstools squashfs-tools ca-certificates debootstrap live-boot \\',
+    '    mtools dosfstools squashfs-tools ca-certificates debootstrap \\',
     '    && rm -rf /var/lib/apt/lists/*',
     '',
     '# ── Stage 1: Build custom kernel ──────────────────────────────────',
@@ -858,16 +862,18 @@ function generateDockerfile(manifest: any, kernelConfig: string): string {
     'RUN cp /usr/src/linux/arch/x86/boot/bzImage /rootfs/boot/vmlinuz-6.6.0-y12',
     'RUN cd /usr/src/linux && make modules_install INSTALL_MOD_PATH=/rootfs',
     '',
+    '# Add non-free-firmware repo for linux-firmware (hardware drivers)',
+    'RUN echo "deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware" > /rootfs/etc/apt/sources.list',
+    '',
   ];
 
-  // Install overlay packages into the rootfs via chroot
-  if (allPkgs.length > 0) {
-    lines.push(
-      '# Install overlay packages into rootfs',
-      `RUN chroot /rootfs /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends${overlayPkgStr} || true && rm -rf /var/lib/apt/lists/*"`,
-      '',
-    );
-  }
+  // Install linux-firmware + mode packages + overlay packages via chroot
+  const allChrootPkgs = ['linux-firmware', ...chrootPkgs].filter(p => p);
+  lines.push(
+    '# Install firmware + mode-specific + overlay packages via chroot',
+    `RUN chroot /rootfs /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${allChrootPkgs.join(' ')} || true && rm -rf /var/lib/apt/lists/*"`,
+    '',
+  );
 
   lines.push(
     '# Configure the rootfs',
@@ -880,8 +886,8 @@ function generateDockerfile(manifest: any, kernelConfig: string): string {
     'RUN chroot /rootfs /bin/bash -c "systemctl enable getty@tty1.service || true"',
     'RUN chroot /rootfs /bin/bash -c "systemctl enable ssh.service || true"',
     '',
-    '# Generate initramfs inside rootfs',
-    'RUN chroot /rootfs /bin/bash -c "apt-get update && apt-get install -y --no-install-recommends initramfs-tools && update-initramfs -c -k 6.6.0-y12 && rm -rf /var/lib/apt/lists/*"',
+    '# Generate initramfs with custom kernel + firmware',
+    'RUN chroot /rootfs /bin/bash -c "update-initramfs -c -k 6.6.0-y12"',
     '',
     '# ── Stage 3: Assemble live ISO ───────────────────────────────────',
     'RUN mkdir -p /iso/boot/grub /iso/live',
