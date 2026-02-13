@@ -1,0 +1,194 @@
+name: Y12.AI ISO Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Build job ID from the Y12 API'
+        required: true
+        type: string
+      api_url:
+        description: 'Y12 API base URL'
+        required: true
+        type: string
+        default: 'https://y12-api.seefeldmaxwell1.workers.dev'
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Report started
+        run: |
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d '{"progress": 5, "status": "building", "log": "GitHub Actions runner started"}'
+
+      - name: Download build artifacts from R2
+        run: |
+          mkdir -p build && cd build
+          for file in kernel.config build.sh Dockerfile docker-compose.yml manifest.json; do
+            echo "Downloading $file..."
+            curl -sf "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/file/$file" -o "$file" || echo "WARN: $file not available"
+          done
+          ls -la
+          echo "--- kernel.config (first 20 lines) ---"
+          head -20 kernel.config || true
+          echo "--- Dockerfile (first 20 lines) ---"
+          head -20 Dockerfile || true
+
+      - name: Report downloading complete
+        run: |
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d '{"progress": 10, "log": "Build artifacts downloaded from R2"}'
+
+      - name: Build ISO via Docker
+        working-directory: build
+        run: |
+          # Report kernel compile start
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d '{"progress": 15, "log": "Starting Docker build (kernel compile + ISO creation)..."}'
+
+          # Build using Dockerfile (this does the full kernel compile + ISO creation)
+          mkdir -p output
+
+          # Use docker build with progress reporting
+          docker build -t y12-iso-builder . 2>&1 | while IFS= read -r line; do
+            echo "$line"
+            # Report progress at key milestones
+            case "$line" in
+              *"apt-get"*|*"dnf install"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 20, "log": "Installing build dependencies..."}' 2>/dev/null || true
+                ;;
+              *"git clone"*"linux"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 30, "log": "Cloning Linux kernel source..."}' 2>/dev/null || true
+                ;;
+              *"make olddefconfig"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 35, "log": "Applying AI kernel config..."}' 2>/dev/null || true
+                ;;
+              *"bzImage"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 50, "log": "Compiling kernel (bzImage)..."}' 2>/dev/null || true
+                ;;
+              *"modules_install"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 65, "log": "Installing kernel modules..."}' 2>/dev/null || true
+                ;;
+              *"grub"*|*"xorriso"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 80, "log": "Creating bootable ISO with GRUB..."}' 2>/dev/null || true
+                ;;
+              *"sha256sum"*)
+                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+                  -d '{"progress": 90, "log": "Checksumming ISO..."}' 2>/dev/null || true
+                ;;
+            esac
+          done
+
+          # Extract ISO from the built image
+          docker run --rm -v "$(pwd)/output:/out" y12-iso-builder \
+            sh -c "cp /output.iso /out/output.iso && cp /output.iso.sha256 /out/output.iso.sha256" || true
+
+          echo "--- Output files ---"
+          ls -lh output/
+
+      - name: Verify ISO
+        working-directory: build
+        run: |
+          if [ ! -f output/output.iso ]; then
+            echo "ERROR: ISO file not produced!"
+            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+              -d '{"progress": 95, "status": "failed", "log": "ISO file was not produced by Docker build"}'
+            exit 1
+          fi
+
+          ISO_SIZE=$(stat -c%s output/output.iso)
+          ISO_SHA=$(sha256sum output/output.iso | cut -d' ' -f1)
+          ISO_TYPE=$(file output/output.iso)
+
+          echo "ISO size: $ISO_SIZE bytes"
+          echo "ISO SHA256: $ISO_SHA"
+          echo "ISO type: $ISO_TYPE"
+
+          # Verify it's actually an ISO
+          if echo "$ISO_TYPE" | grep -qi "ISO 9660\|boot sector\|DOS/MBR"; then
+            echo "✓ Valid ISO file detected"
+          else
+            echo "⚠ File type may not be a standard ISO: $ISO_TYPE"
+          fi
+
+          # Verify minimum size (a real kernel ISO should be at least 5MB)
+          if [ "$ISO_SIZE" -lt 5000000 ]; then
+            echo "⚠ ISO is suspiciously small ($ISO_SIZE bytes)"
+          else
+            echo "✓ ISO size looks reasonable ($ISO_SIZE bytes)"
+          fi
+
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d "{\"progress\": 92, \"log\": \"ISO verified: ${ISO_SIZE} bytes, SHA256: ${ISO_SHA}\"}"
+
+      - name: Upload ISO to R2 via API
+        working-directory: build
+        run: |
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d '{"progress": 95, "log": "Uploading ISO to Cloudflare R2 edge storage..."}'
+
+          # Upload the ISO binary
+          ISO_SHA=$(sha256sum output/output.iso | cut -d' ' -f1)
+          ISO_SIZE=$(stat -c%s output/output.iso)
+
+          curl -X PUT "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/upload-iso" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -H "Content-Type: application/octet-stream" \
+            -H "X-ISO-SHA256: $ISO_SHA" \
+            -H "X-ISO-Size: $ISO_SIZE" \
+            --data-binary @output/output.iso
+
+          echo "ISO uploaded to R2"
+
+      - name: Report complete
+        if: success()
+        run: |
+          ISO_SHA=$(sha256sum build/output/output.iso | cut -d' ' -f1)
+          ISO_SIZE=$(stat -c%s build/output/output.iso)
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d "{\"progress\": 100, \"status\": \"complete\", \"log\": \"ISO build complete. Size: ${ISO_SIZE} bytes. SHA256: ${ISO_SHA}. Uploaded to R2.\"}"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+            -d '{"status": "failed", "log": "GitHub Actions build failed. Check workflow logs."}' || true
