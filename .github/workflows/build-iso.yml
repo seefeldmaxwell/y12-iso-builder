@@ -47,72 +47,65 @@ jobs:
       - name: Build ISO via Docker
         working-directory: build
         run: |
-          # Report kernel compile start
+          set -e
+          mkdir -p output
+
           curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-            -d '{"progress": 15, "log": "Starting Docker build (kernel compile + ISO creation)..."}'
+            -d '{"progress": 15, "log": "Starting Docker build..."}'
 
-          # Build using Dockerfile (this does the full kernel compile + ISO creation)
-          mkdir -p output
+          echo "=== Dockerfile ==="
+          cat Dockerfile
+          echo "=== kernel.config ==="
+          cat kernel.config
+          echo "=== Starting docker build ==="
 
-          # Use docker build with progress reporting
-          docker build -t y12-iso-builder . 2>&1 | while IFS= read -r line; do
-            echo "$line"
-            # Report progress at key milestones
-            case "$line" in
-              *"apt-get"*|*"dnf install"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 20, "log": "Installing build dependencies..."}' 2>/dev/null || true
-                ;;
-              *"git clone"*"linux"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 30, "log": "Cloning Linux kernel source..."}' 2>/dev/null || true
-                ;;
-              *"make olddefconfig"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 35, "log": "Applying AI kernel config..."}' 2>/dev/null || true
-                ;;
-              *"bzImage"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 50, "log": "Compiling kernel (bzImage)..."}' 2>/dev/null || true
-                ;;
-              *"modules_install"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 65, "log": "Installing kernel modules..."}' 2>/dev/null || true
-                ;;
-              *"grub"*|*"xorriso"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 80, "log": "Creating bootable ISO with GRUB..."}' 2>/dev/null || true
-                ;;
-              *"sha256sum"*)
-                curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-                  -d '{"progress": 90, "log": "Checksumming ISO..."}' 2>/dev/null || true
-                ;;
-            esac
-          done
+          # Build with --progress=plain so we see all output, capture exit code
+          set +e
+          docker build --progress=plain -t y12-iso-builder . 2>&1 | tee /tmp/docker-build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
 
-          # Extract ISO from the built image using docker create + docker cp
+          # Report progress milestones from the log
+          if grep -q "git clone" /tmp/docker-build.log; then
+            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+              -d '{"progress": 30, "log": "Kernel source cloned"}' 2>/dev/null || true
+          fi
+          if grep -q "bzImage" /tmp/docker-build.log; then
+            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+              -d '{"progress": 60, "log": "Kernel compiled (bzImage)"}' 2>/dev/null || true
+          fi
+          if grep -q "grub\|xorriso\|mkisofs" /tmp/docker-build.log; then
+            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+              -d '{"progress": 85, "log": "ISO created with bootloader"}' 2>/dev/null || true
+          fi
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            LAST_LINES=$(tail -30 /tmp/docker-build.log | tr '\n' ' ' | cut -c1-500)
+            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
+              -d "{\"progress\": 50, \"status\": \"failed\", \"log\": \"Docker build failed: ${LAST_LINES}\"}" 2>/dev/null || true
+            echo "Docker build failed with exit code $BUILD_EXIT"
+            echo "=== Last 50 lines of build log ==="
+            tail -50 /tmp/docker-build.log
+            exit 1
+          fi
+
+          echo "=== Docker build succeeded, extracting ISO ==="
           EXTRACT_ID=$(docker create y12-iso-builder)
           docker cp "$EXTRACT_ID:/output.iso" output/output.iso || true
           docker cp "$EXTRACT_ID:/output.iso.sha256" output/output.iso.sha256 || true
           docker rm "$EXTRACT_ID"
 
-          echo "--- Output files ---"
+          echo "=== Output files ==="
           ls -lh output/
 
       - name: Verify ISO
