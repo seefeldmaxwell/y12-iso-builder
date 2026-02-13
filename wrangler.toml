@@ -1,0 +1,26 @@
+name = "y12-api"
+main = "worker/src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+FRONTEND_URL = "https://y12-iso-builder.pages.dev"
+STRIPE_PRICE_CENTS = "2000"
+TEST_MODE = "true"
+GITHUB_REPO = "seefeldmaxwell/y12-iso-builder"
+# Secrets (set via `wrangler secret put <NAME>`):
+# ANTHROPIC_API_KEY
+# STRIPE_SECRET_KEY
+# GITHUB_TOKEN
+# BUILD_SECRET
+
+[ai]
+binding = "AI"
+
+[[r2_buckets]]
+binding = "ISO_STORAGE"
+bucket_name = "y12-iso-storage"
+
+[[kv_namespaces]]
+binding = "BUILD_JOBS"
+id = "6145bddece514a3a94e3709b9950da77"

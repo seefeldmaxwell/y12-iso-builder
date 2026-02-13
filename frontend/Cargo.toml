@@ -1,0 +1,34 @@
+[package]
+name = "iso-creator-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.6", features = ["csr"] }
+leptos_meta = { version = "0.6", features = ["csr"] }
+leptos_router = { version = "0.6", features = ["csr"] }
+wasm-bindgen = "0.2"
+console_log = "1"
+console_error_panic_hook = "0.1"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+web-sys = { version = "0.3", features = [
+  "console",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "Navigator",
+  "Window",
+  "Usb",
+  "UsbDevice",
+  "UsbDeviceRequestOptions",
+  "UsbDeviceFilter",
+] }
+js-sys = "0.3"
+gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
