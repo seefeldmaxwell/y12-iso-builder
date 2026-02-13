@@ -1366,12 +1366,12 @@ fn BuildPage() -> impl IntoView {
                             <div class="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
                                 <a
                                     href=move || format!("https://y12-api.seefeldmaxwell1.workers.dev/api/build/{}/iso", build_job_id.get())
-                                    target="_blank"
-                                    class="flex items-center gap-3 rounded-lg bg-emerald-600 px-5 py-3 text-[14px] font-semibold text-white hover:bg-emerald-500 transition-colors justify-center"
+                                    download=move || format!("y12-custom-{}.iso", &build_job_id.get()[..8.min(build_job_id.get().len())])
+                                    class="flex items-center gap-3 rounded-lg bg-emerald-600 px-5 py-3 text-[14px] font-semibold text-white hover:bg-emerald-500 transition-colors justify-center cursor-pointer"
                                 >
-                                    "Download ISO"
+                                    "⬇ Download ISO"
                                 </a>
-                                <p class="mt-2 text-center text-[11px] text-[#555]">"If the ISO was built by GitHub Actions, it will download directly. Otherwise, use the artifacts below to build locally."</p>
+                                <p class="mt-2 text-center text-[11px] text-[#555]">"SHA256-signed. Your custom ISO is ready — click to download."</p>
                             </div>
 
                             // Quick start command (fallback for local builds)

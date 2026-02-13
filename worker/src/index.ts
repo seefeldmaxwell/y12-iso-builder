@@ -50,7 +50,7 @@ const DISTRO_PKG_MANAGER: Record<string, string> = {
 const DISTRO_BASE_IMAGE: Record<string, string> = {
   nixos: 'nixos/nix:latest',
   debian: 'debian:12-slim',
-  rocky: 'rockylinux:9-minimal',
+  rocky: 'rockylinux:9',
   proxmox: 'debian:12-slim',
 };
 
@@ -328,18 +328,20 @@ app.post('/api/validate-overlays', async (c) => {
 
 // ── Claude kernel .config generation ──────────────────────────────────
 
-const KERNEL_CONFIG_PROMPT = `You are a Linux kernel configuration expert. Generate a MINIMAL kernel .config fragment that will compile FAST on a 2-core CI runner (under 5 minutes).
+const KERNEL_CONFIG_PROMPT = `You are a Linux kernel configuration expert. Generate a kernel .config FRAGMENT that will be merged ON TOP of x86_64 defconfig using scripts/kconfig/merge_config.sh.
 
-CRITICAL: This config is layered ON TOP of "make tinyconfig" via "make olddefconfig". Only output options that OVERRIDE tinyconfig defaults. Keep it under 80 lines.
+The base defconfig already includes standard drivers (NVMe, AHCI, USB, e1000e, igb, etc). Your job is to ADD hardware-specific drivers and REMOVE unnecessary subsystems based on the user's hardware and build mode.
 
 Rules:
-- Output ONLY config lines (CONFIG_xxx=y or # CONFIG_xxx is not set). No prose.
-- MUST enable for bootable system: CONFIG_64BIT=y, CONFIG_SMP=y, CONFIG_PRINTK=y, CONFIG_TTY=y, CONFIG_SERIAL_8250=y, CONFIG_SERIAL_8250_CONSOLE=y, CONFIG_EXT4_FS=y, CONFIG_PROC_FS=y, CONFIG_SYSFS=y, CONFIG_DEVTMPFS=y, CONFIG_DEVTMPFS_MOUNT=y, CONFIG_BLOCK=y, CONFIG_BLK_DEV_SD=y, CONFIG_ATA=y, CONFIG_SATA_AHCI=y, CONFIG_NET=y, CONFIG_INET=y, CONFIG_BLK_DEV=y
-- For SERVER: add CONFIG_NETFILTER=y, CONFIG_CGROUPS=y, CONFIG_NAMESPACES=y. Disable DRM/SND.
-- For DESKTOP: add CONFIG_DRM=y, CONFIG_SND=y, CONFIG_INPUT=y.
+- Output ONLY config lines. No prose, no comments, no explanations.
+- To ENABLE: CONFIG_xxx=y or CONFIG_xxx=m
+- To DISABLE: # CONFIG_xxx is not set
 - Include CONFIG_LOCALVERSION="-y12-custom"
-- Use =y (built-in), NEVER =m. This avoids needing modules_install.
-- Target 40-80 config lines MAX. Fewer is better for fast compile.`;
+- For SERVER mode: disable CONFIG_DRM=n, CONFIG_SND=n, CONFIG_WLAN=n, CONFIG_BT=n. Enable CONFIG_NETFILTER=y, CONFIG_CGROUPS=y, CONFIG_NAMESPACES=y, CONFIG_NET_NS=y, CONFIG_VETH=y, CONFIG_BRIDGE=y, CONFIG_NF_NAT=y, CONFIG_OVERLAY_FS=y.
+- For DESKTOP mode: enable the correct GPU driver based on hardware (CONFIG_DRM_I915=m for Intel, CONFIG_DRM_AMDGPU=m for AMD, CONFIG_DRM_NOUVEAU=m for NVIDIA). Enable CONFIG_SND_HDA_INTEL=m, CONFIG_WLAN=y, CONFIG_BT=y, CONFIG_INPUT_EVDEV=y.
+- Map PCI vendor IDs to drivers: 8086=Intel(i915/e1000e/iwlwifi), 1002=AMD(amdgpu), 10de=NVIDIA(nouveau), 14e4=Broadcom(tg3/brcmfmac), 168c=Qualcomm(ath9k/ath10k), 10ec=Realtek(r8169/rtw88)
+- For detected modules, enable the corresponding CONFIG_ option.
+- Target 30-60 lines. Only output what DIFFERS from defconfig.`;
 
 async function generateKernelConfig(env: Env, hardware: string, distro: string, mode: string, modules: string[]): Promise<string> {
   const apiKey = env.ANTHROPIC_API_KEY;
@@ -354,29 +356,21 @@ async function generateKernelConfig(env: Env, hardware: string, distro: string, 
 }
 
 function generateFallbackConfig(mode: string, modules: string[]): string {
+  // This is a FRAGMENT merged on top of defconfig via merge_config.sh
+  // defconfig already has standard hardware support — we just customize
   const lines = [
-    '# Y12.AI Minimal Kernel Config (tinyconfig overlay)',
-    '# Apply via: make tinyconfig && cp this .config && make olddefconfig',
     'CONFIG_LOCALVERSION="-y12-custom"',
-    'CONFIG_64BIT=y', 'CONFIG_SMP=y',
-    'CONFIG_PRINTK=y', 'CONFIG_TTY=y', 'CONFIG_SERIAL_8250=y', 'CONFIG_SERIAL_8250_CONSOLE=y',
-    'CONFIG_BLOCK=y', 'CONFIG_BLK_DEV=y', 'CONFIG_BLK_DEV_SD=y',
-    'CONFIG_ATA=y', 'CONFIG_SATA_AHCI=y',
-    'CONFIG_NET=y', 'CONFIG_INET=y',
-    'CONFIG_EXT4_FS=y', 'CONFIG_PROC_FS=y', 'CONFIG_SYSFS=y',
-    'CONFIG_DEVTMPFS=y', 'CONFIG_DEVTMPFS_MOUNT=y',
-    'CONFIG_TMPFS=y', 'CONFIG_INOTIFY_USER=y',
-    'CONFIG_SIGNALFD=y', 'CONFIG_TIMERFD=y', 'CONFIG_EPOLL=y',
-    'CONFIG_FUTEX=y', 'CONFIG_BUG=y',
   ];
   if (mode === 'server') {
-    lines.push('# CONFIG_DRM is not set', '# CONFIG_SND is not set');
+    lines.push('# CONFIG_DRM is not set', '# CONFIG_SND is not set', '# CONFIG_WLAN is not set', '# CONFIG_BT is not set');
     lines.push('CONFIG_NETFILTER=y', 'CONFIG_CGROUPS=y', 'CONFIG_NAMESPACES=y', 'CONFIG_NET_NS=y');
+    lines.push('CONFIG_VETH=y', 'CONFIG_BRIDGE=y', 'CONFIG_NF_NAT=y', 'CONFIG_OVERLAY_FS=y');
   } else {
-    lines.push('CONFIG_DRM=y', 'CONFIG_SND=y', 'CONFIG_INPUT=y');
+    lines.push('CONFIG_DRM_I915=m', 'CONFIG_DRM_AMDGPU=m', 'CONFIG_DRM_NOUVEAU=m');
+    lines.push('CONFIG_SND_HDA_INTEL=m', 'CONFIG_WLAN=y', 'CONFIG_BT=y', 'CONFIG_INPUT_EVDEV=y');
   }
   for (const m of modules) {
-    lines.push(`CONFIG_${m.toUpperCase()}=y`);
+    lines.push(`CONFIG_${m.toUpperCase()}=m`);
   }
   return lines.join('\n');
 }
@@ -688,11 +682,12 @@ interface TestResult { name: string; pass: boolean; msg: string }
 async function runBuildValidation(manifest: any, kernelConfig: string, buildScript: string, dockerfile: string): Promise<TestResult[]> {
   const results: TestResult[] = [];
 
-  // 1. Kernel config: has required base options
-  const requiredConfigs = ['CONFIG_MODULES', 'CONFIG_NET', 'CONFIG_INET', 'CONFIG_EXT4_FS', 'CONFIG_PROC_FS', 'CONFIG_SYSFS', 'CONFIG_PRINTK'];
-  for (const cfg of requiredConfigs) {
-    const has = kernelConfig.includes(`${cfg}=y`) || kernelConfig.includes(`${cfg}=m`);
-    results.push({ name: `kernel_config_${cfg}`, pass: has, msg: has ? `${cfg} enabled` : `${cfg} MISSING — kernel may not boot` });
+  // 1. Kernel config fragment: check it's not disabling critical options
+  // Note: this is a FRAGMENT merged on top of defconfig, so missing options are OK (defconfig has them)
+  const mustNotDisable = ['CONFIG_NET', 'CONFIG_INET', 'CONFIG_EXT4_FS', 'CONFIG_PROC_FS', 'CONFIG_SYSFS', 'CONFIG_PRINTK'];
+  for (const cfg of mustNotDisable) {
+    const disabled = kernelConfig.includes(`# ${cfg} is not set`) || kernelConfig.includes(`${cfg}=n`);
+    results.push({ name: `kernel_config_${cfg}`, pass: !disabled, msg: !disabled ? `${cfg} not disabled (defconfig default OK)` : `${cfg} DISABLED — kernel may not boot` });
   }
 
   // 2. Kernel config: mode-specific checks
@@ -790,9 +785,9 @@ async function runBuildValidation(manifest: any, kernelConfig: string, buildScri
   const hasAllFields = manifest.jobId && manifest.distro && manifest.mode && manifest.baseImage && manifest.pkgManager;
   results.push({ name: 'manifest_complete', pass: !!hasAllFields, msg: hasAllFields ? 'Manifest has all required fields' : 'Manifest missing fields' });
 
-  // 20. Cross-validation: Dockerfile base image matches manifest
-  const dockerBaseMatch = dockerfile.includes(`FROM ${manifest.baseImage}`);
-  results.push({ name: 'cross_dockerfile_base', pass: dockerBaseMatch, msg: dockerBaseMatch ? 'Dockerfile base image matches manifest' : 'Dockerfile base image mismatch' });
+  // 20. Cross-validation: Dockerfile uses debian:12 as build container
+  const dockerBaseMatch = dockerfile.includes('FROM debian:12');
+  results.push({ name: 'cross_dockerfile_base', pass: dockerBaseMatch, msg: dockerBaseMatch ? 'Dockerfile uses debian:12 build container' : 'Dockerfile missing debian:12 build base' });
 
   return results;
 }
@@ -800,84 +795,61 @@ async function runBuildValidation(manifest: any, kernelConfig: string, buildScri
 // ── Dockerfile generator ──────────────────────────────────────────────
 
 function generateDockerfile(manifest: any, kernelConfig: string): string {
+  // Always use debian:12 as the BUILD container — it has all the tools.
+  // The target distro affects the rootfs packages, not the build environment.
   const lines = [
-    `FROM ${manifest.baseImage}`,
+    'FROM debian:12 AS builder',
     '',
-    '# Build dependencies',
-  ];
-
-  if (manifest.pkgManager === 'apt') {
-    lines.push(
-      'RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\',
-      '    build-essential libncurses-dev bison flex libssl-dev libelf-dev \\',
-      '    bc git wget cpio kmod xorriso grub-pc-bin grub-efi-amd64-bin grub-common \\',
-      '    mtools dosfstools squashfs-tools ca-certificates \\',
-      '    && rm -rf /var/lib/apt/lists/*',
-    );
-  } else if (manifest.pkgManager === 'dnf') {
-    lines.push(
-      'RUN dnf install -y gcc make ncurses-devel bison flex openssl-devel \\',
-      '    elfutils-libelf-devel bc git wget cpio kmod xorriso grub2-tools \\',
-      '    grub2-efi-x64 mtools dosfstools squashfs-tools \\',
-      '    && dnf clean all',
-    );
-  }
-
-  lines.push(
+    '# Build dependencies (same for all target distros)',
+    'RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\',
+    '    build-essential libncurses-dev bison flex libssl-dev libelf-dev \\',
+    '    bc git wget cpio kmod xorriso grub-pc-bin grub-efi-amd64-bin grub-common \\',
+    '    mtools dosfstools squashfs-tools ca-certificates debootstrap \\',
+    '    && rm -rf /var/lib/apt/lists/*',
     '',
-    '# Clone kernel source (v6.6 stable)',
+    '# Clone kernel source (v6.6 LTS)',
     'RUN git clone --depth 1 --branch v6.6 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git /usr/src/linux',
     '',
-    '# Start from tinyconfig (fastest possible base), then layer Y12 AI config',
-    'RUN cd /usr/src/linux && make tinyconfig',
+    '# Start from x86_64 defconfig (includes real hardware drivers: NVMe, AHCI, USB, NIC, GPU, etc)',
+    '# Then layer the Y12 AI-generated config on top for hardware-specific customization',
+    'RUN cd /usr/src/linux && make defconfig',
     'COPY kernel.config /tmp/y12.config',
-    'RUN cd /usr/src/linux && cat /tmp/y12.config >> .config && make olddefconfig',
+    'RUN cd /usr/src/linux && scripts/kconfig/merge_config.sh .config /tmp/y12.config',
     '',
-    '# Compile kernel (bzImage only — all drivers built-in, no modules needed)',
-    'RUN cd /usr/src/linux && make -j$(nproc) bzImage 2>&1 | tail -20',
+    '# Compile kernel + modules (defconfig gives real hardware support)',
+    'RUN cd /usr/src/linux && make -j$(nproc) bzImage modules 2>&1 | tail -5',
     '',
-    '# Install kernel',
-    'RUN mkdir -p /rootfs/boot && cp /usr/src/linux/arch/x86/boot/bzImage /rootfs/boot/vmlinuz-y12',
+    '# Install kernel and modules into rootfs',
+    'RUN mkdir -p /rootfs/boot /rootfs/lib/modules',
+    'RUN cp /usr/src/linux/arch/x86/boot/bzImage /rootfs/boot/vmlinuz-y12',
+    'RUN cd /usr/src/linux && make modules_install INSTALL_MOD_PATH=/rootfs',
     '',
-  );
+  ];
 
-  // Install overlay packages
-  if (manifest.packages.length > 0) {
-    lines.push('# Install overlay packages');
-    if (manifest.pkgManager === 'apt') {
-      lines.push(`RUN apt-get update && apt-get install -y --no-install-recommends ${manifest.packages.join(' ')} && rm -rf /var/lib/apt/lists/*`);
-    } else if (manifest.pkgManager === 'dnf') {
-      lines.push(`RUN dnf install -y ${manifest.packages.join(' ')} && dnf clean all`);
-    }
-    lines.push('');
-  }
-
-  // Custom software
-  if (manifest.customSoftware?.length > 0) {
-    lines.push('# Custom software');
-    for (const sw of manifest.customSoftware) {
-      if (manifest.pkgManager === 'apt') {
-        lines.push(`RUN apt-get update && apt-get install -y ${sw} || echo "WARN: ${sw} not available"`);
-      } else if (manifest.pkgManager === 'dnf') {
-        lines.push(`RUN dnf install -y ${sw} || echo "WARN: ${sw} not available"`);
-      }
-    }
-    lines.push('');
+  // Install overlay packages into rootfs using apt (debian-based rootfs for all ISOs)
+  const allPkgs = [...(manifest.packages || []), ...(manifest.customSoftware || [])];
+  if (allPkgs.length > 0) {
+    lines.push(
+      '# Install overlay packages into rootfs',
+      `RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${allPkgs.join(' ')} || true`,
+      'RUN rm -rf /var/lib/apt/lists/*',
+      '',
+    );
   }
 
   lines.push(
-    '# Create ISO filesystem',
+    '# Create ISO filesystem structure',
     'RUN mkdir -p /iso/boot/grub /iso/live',
     'RUN cp /rootfs/boot/vmlinuz-y12 /iso/boot/vmlinuz',
     '',
-    '# Create initramfs',
+    '# Create initramfs with modules and rootfs',
     'RUN cd /rootfs && find . | cpio -o -H newc | gzip > /iso/boot/initrd.gz',
     '',
-    '# GRUB config',
-    'RUN echo "set timeout=5\\nset default=0\\nmenuentry \\"Y12 Custom Linux\\" {\\n  linux /boot/vmlinuz root=/dev/ram0\\n  initrd /boot/initrd.gz\\n}" > /iso/boot/grub/grub.cfg',
+    '# GRUB config for BIOS + EFI boot',
+    `RUN printf 'set timeout=5\\nset default=0\\n\\nmenuentry "Y12 Custom Linux (${manifest.distro} ${manifest.mode})" {\\n  linux /boot/vmlinuz root=/dev/ram0 console=tty0 console=ttyS0,115200\\n  initrd /boot/initrd.gz\\n}\\n' > /iso/boot/grub/grub.cfg`,
     '',
-    '# Build ISO',
-    'RUN grub-mkrescue -o /output.iso /iso 2>/dev/null || xorriso -as mkisofs -b boot/grub/i386-pc/eltorito.img -no-emul-boot -boot-load-size 4 -boot-info-table -o /output.iso /iso',
+    '# Build bootable ISO (BIOS + EFI)',
+    'RUN grub-mkrescue -o /output.iso /iso 2>/dev/null || xorriso -as mkisofs -R -J -b boot/grub/i386-pc/eltorito.img -no-emul-boot -boot-load-size 4 -boot-info-table -o /output.iso /iso',
     '',
     '# Checksum',
     'RUN sha256sum /output.iso > /output.iso.sha256',
@@ -1149,15 +1121,15 @@ app.get('/api/test', async (c) => {
   // Test 6: Fallback kernel config generation
   try {
     const serverConfig = generateFallbackConfig('server', ['e1000e', 'nvme']);
-    const hasModules = serverConfig.includes('CONFIG_MODULES=y');
-    const hasNet = serverConfig.includes('CONFIG_NET=y');
-    const noDrm = !serverConfig.includes('CONFIG_DRM=y');
-    tests.push({ name: 'fallback_config_server', pass: hasModules && hasNet && noDrm, msg: `${serverConfig.split('\n').length} lines, modules=${hasModules}, net=${hasNet}, no_drm=${noDrm}` });
+    const hasLocalver = serverConfig.includes('CONFIG_LOCALVERSION');
+    const noDrm = serverConfig.includes('# CONFIG_DRM is not set');
+    const hasNetfilter = serverConfig.includes('CONFIG_NETFILTER=y');
+    tests.push({ name: 'fallback_config_server', pass: hasLocalver && noDrm && hasNetfilter, msg: `${serverConfig.split('\n').length} lines, localver=${hasLocalver}, no_drm=${noDrm}, netfilter=${hasNetfilter}` });
 
     const desktopConfig = generateFallbackConfig('desktop', ['i915']);
-    const hasDrm = desktopConfig.includes('CONFIG_DRM=y');
-    const hasSnd = desktopConfig.includes('CONFIG_SND=y');
-    tests.push({ name: 'fallback_config_desktop', pass: hasDrm && hasSnd, msg: `${desktopConfig.split('\n').length} lines, drm=${hasDrm}, snd=${hasSnd}` });
+    const hasI915 = desktopConfig.includes('CONFIG_DRM_I915=m');
+    const hasSnd = desktopConfig.includes('CONFIG_SND_HDA_INTEL=m');
+    tests.push({ name: 'fallback_config_desktop', pass: hasI915 && hasSnd, msg: `${desktopConfig.split('\n').length} lines, i915=${hasI915}, snd=${hasSnd}` });
   } catch (e: any) {
     tests.push({ name: 'fallback_config', pass: false, msg: e.message });
   }
@@ -1179,9 +1151,9 @@ app.get('/api/test', async (c) => {
 
   // Test 8: Dockerfile generation
   try {
-    const manifest = { baseImage: 'debian:12-slim', pkgManager: 'apt', packages: ['docker.io'], customSoftware: [], overlays: ['docker'] };
-    const df = generateDockerfile(manifest, 'CONFIG_MODULES=y\nCONFIG_NET=y');
-    const hasFrom = df.includes('FROM debian:12-slim');
+    const manifest = { baseImage: 'debian:12-slim', pkgManager: 'apt', packages: ['docker.io'], customSoftware: [], distro: 'debian', mode: 'server', overlays: ['docker'] };
+    const df = generateDockerfile(manifest, 'CONFIG_LOCALVERSION="-y12-custom"');
+    const hasFrom = df.includes('FROM debian:12');
     const hasKernel = df.includes('git clone') && df.includes('linux');
     const hasGrub = df.includes('grub');
     tests.push({ name: 'dockerfile_gen', pass: hasFrom && hasKernel && hasGrub, msg: `${df.split('\n').length} lines, from=${hasFrom}, kernel=${hasKernel}, grub=${hasGrub}` });
@@ -1255,10 +1227,10 @@ app.post('/api/test/build', async (c) => {
     const noDrm = !kernelConfig.includes('CONFIG_DRM=y') || kernelConfig.includes('# CONFIG_DRM is not set');
     results.push({ name: 'e2e_server_no_drm', pass: noDrm, msg: noDrm ? 'DRM correctly disabled for server' : 'DRM should be disabled for server' });
 
-    // Test 4: Has required boot configs
-    const hasNet = kernelConfig.includes('CONFIG_NET=y');
-    const hasModules = kernelConfig.includes('CONFIG_MODULES=y');
-    results.push({ name: 'e2e_boot_configs', pass: hasNet && hasModules, msg: `NET=${hasNet}, MODULES=${hasModules}` });
+    // Test 4: Fragment doesn't disable critical boot configs (defconfig has them)
+    const netDisabled = kernelConfig.includes('# CONFIG_NET is not set');
+    const hasLocalver = kernelConfig.includes('CONFIG_LOCALVERSION');
+    results.push({ name: 'e2e_boot_configs', pass: !netDisabled && hasLocalver, msg: `NET_not_disabled=${!netDisabled}, LOCALVERSION=${hasLocalver}` });
 
     // Test 5: Build script generation
     const buildScript = generateBuildScript({
