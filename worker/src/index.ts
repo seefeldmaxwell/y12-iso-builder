@@ -1072,17 +1072,103 @@ app.get('/api/build/:id/file/:filename', async (c) => {
   });
 });
 
-// ── Upload ISO from GitHub Actions ────────────────────────────────────
+// ── Upload ISO from GitHub Actions (R2 multipart for large files) ─────
 
-app.put('/api/build/:id/upload-iso', async (c) => {
-  const jobId = c.req.param('id');
-
-  // Auth check — only GitHub Actions with BUILD_SECRET can upload
+// Helper: auth check for upload endpoints
+function checkBuildAuth(c: any): boolean {
   const auth = c.req.header('Authorization');
   const secret = c.env.BUILD_SECRET;
-  if (!secret || auth !== `Bearer ${secret}`) {
-    return c.json({ error: 'Unauthorized' }, 401);
+  return !!(secret && auth === `Bearer ${secret}`);
+}
+
+// Step 1: Start multipart upload — returns uploadId
+app.post('/api/build/:id/upload-iso/start', async (c) => {
+  const jobId = c.req.param('id');
+  if (!checkBuildAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
+
+  const data = await c.env.BUILD_JOBS.get(`job:${jobId}`);
+  if (!data) return c.json({ error: 'Build not found' }, 404);
+
+  const r2Key = `builds/${jobId}/output.iso`;
+  const mpu = await c.env.ISO_STORAGE.createMultipartUpload(r2Key, {
+    httpMetadata: { contentType: 'application/octet-stream' },
+  });
+
+  return c.json({ ok: true, uploadId: mpu.uploadId, r2Key });
+});
+
+// Step 2: Upload a single part (< 100MB each)
+app.put('/api/build/:id/upload-iso/part', async (c) => {
+  const jobId = c.req.param('id');
+  if (!checkBuildAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
+
+  const uploadId = c.req.header('X-Upload-Id');
+  const partNumber = parseInt(c.req.header('X-Part-Number') || '0', 10);
+  if (!uploadId || partNumber < 1) {
+    return c.json({ error: 'Missing X-Upload-Id or X-Part-Number header' }, 400);
   }
+
+  const r2Key = `builds/${jobId}/output.iso`;
+  const mpu = c.env.ISO_STORAGE.resumeMultipartUpload(r2Key, uploadId);
+
+  const rawBody = c.req.raw.body;
+  if (!rawBody) return c.json({ error: 'No body provided' }, 400);
+
+  try {
+    const part = await mpu.uploadPart(partNumber, rawBody);
+    return c.json({ ok: true, partNumber: part.partNumber, etag: part.etag });
+  } catch (e: any) {
+    return c.json({ error: `Part upload failed: ${e.message}` }, 500);
+  }
+});
+
+// Step 3: Complete multipart upload — assembles all parts
+app.post('/api/build/:id/upload-iso/complete', async (c) => {
+  const jobId = c.req.param('id');
+  if (!checkBuildAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
+
+  const data = await c.env.BUILD_JOBS.get(`job:${jobId}`);
+  if (!data) return c.json({ error: 'Build not found' }, 404);
+
+  const body = await c.req.json();
+  const { uploadId, parts, sha256, size } = body;
+  // parts = [{ partNumber: 1, etag: "..." }, ...]
+
+  if (!uploadId || !parts || !Array.isArray(parts)) {
+    return c.json({ error: 'Missing uploadId or parts array' }, 400);
+  }
+
+  const r2Key = `builds/${jobId}/output.iso`;
+  const mpu = c.env.ISO_STORAGE.resumeMultipartUpload(r2Key, uploadId);
+
+  try {
+    await mpu.complete(parts);
+  } catch (e: any) {
+    return c.json({ error: `Multipart complete failed: ${e.message}` }, 500);
+  }
+
+  // Verify
+  const head = await c.env.ISO_STORAGE.head(r2Key);
+  if (!head) {
+    return c.json({ error: 'R2 upload verification failed' }, 500);
+  }
+
+  // Update job
+  const job = JSON.parse(data);
+  job.iso_uploaded = true;
+  job.iso_size = head.size;
+  job.iso_sha256 = sha256 || 'unknown';
+  job.iso_r2_key = r2Key;
+  job.logs.push(`[${new Date().toISOString()}] ISO uploaded to R2: ${head.size} bytes, SHA256: ${sha256 || 'unknown'}`);
+  await c.env.BUILD_JOBS.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 86400 * 7 });
+
+  return c.json({ ok: true, r2_key: r2Key, size: head.size, sha256: sha256 || 'unknown' });
+});
+
+// Legacy single-request upload (for ISOs < 95MB)
+app.put('/api/build/:id/upload-iso', async (c) => {
+  const jobId = c.req.param('id');
+  if (!checkBuildAuth(c)) return c.json({ error: 'Unauthorized' }, 401);
 
   const data = await c.env.BUILD_JOBS.get(`job:${jobId}`);
   if (!data) return c.json({ error: 'Build not found' }, 404);
@@ -1090,12 +1176,9 @@ app.put('/api/build/:id/upload-iso', async (c) => {
   const isoSha = c.req.header('X-ISO-SHA256') || 'unknown';
   const isoSize = c.req.header('X-ISO-Size') || '0';
 
-  // Stream the request body directly to R2 (supports up to 5GB)
   const r2Key = `builds/${jobId}/output.iso`;
   const rawBody = c.req.raw.body;
-  if (!rawBody) {
-    return c.json({ error: 'No body provided' }, 400);
-  }
+  if (!rawBody) return c.json({ error: 'No body provided' }, 400);
 
   try {
     await c.env.ISO_STORAGE.put(r2Key, rawBody, {
@@ -1106,13 +1189,9 @@ app.put('/api/build/:id/upload-iso', async (c) => {
     return c.json({ error: `R2 upload failed: ${e.message}` }, 500);
   }
 
-  // Verify the upload
   const head = await c.env.ISO_STORAGE.head(r2Key);
-  if (!head) {
-    return c.json({ error: 'R2 upload verification failed — object not found after put' }, 500);
-  }
+  if (!head) return c.json({ error: 'R2 upload verification failed' }, 500);
 
-  // Update job with ISO info
   const job = JSON.parse(data);
   job.iso_uploaded = true;
   job.iso_size = head.size;

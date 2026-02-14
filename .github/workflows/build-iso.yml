@@ -147,41 +147,80 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
             -d "{\"progress\": 92, \"log\": \"ISO verified: ${ISO_SIZE} bytes, SHA256: ${ISO_SHA}\"}"
 
-      - name: Upload ISO to R2 via API
+      - name: Upload ISO to R2 via multipart API
         working-directory: build
         run: |
-          curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
+          API_URL="${{ inputs.api_url }}"
+          JOB_ID="${{ inputs.job_id }}"
+          AUTH="Bearer ${{ secrets.BUILD_SECRET }}"
+          ISO_FILE="output/output.iso"
+          ISO_SHA=$(sha256sum "$ISO_FILE" | cut -d' ' -f1)
+          ISO_SIZE=$(stat -c%s "$ISO_FILE")
+          CHUNK_SIZE=90000000  # ~90MB chunks (under CF 100MB limit)
+
+          curl -s -X POST "$API_URL/api/build/$JOB_ID/progress" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-            -d '{"progress": 95, "log": "Uploading ISO to Cloudflare R2 edge storage..."}'
+            -H "Authorization: $AUTH" \
+            -d "{\"progress\": 95, \"log\": \"Uploading ISO to R2 (${ISO_SIZE} bytes, multipart)...\"}"
 
-          # Upload the ISO binary
-          ISO_SHA=$(sha256sum output/output.iso | cut -d' ' -f1)
-          ISO_SIZE=$(stat -c%s output/output.iso)
+          echo "ISO: ${ISO_SIZE} bytes, SHA256: ${ISO_SHA}"
 
-          echo "Uploading ${ISO_SIZE} bytes to R2..."
-          UPLOAD_RESP=$(curl -s -w "\n%{http_code}" -X PUT "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/upload-iso" \
-            -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-            -H "Content-Type: application/octet-stream" \
-            -H "X-ISO-SHA256: $ISO_SHA" \
-            -H "X-ISO-Size: $ISO_SIZE" \
-            --data-binary @output/output.iso)
+          # Step 1: Start multipart upload
+          START_RESP=$(curl -s -X POST "$API_URL/api/build/$JOB_ID/upload-iso/start" \
+            -H "Authorization: $AUTH" \
+            -H "Content-Type: application/json")
+          UPLOAD_ID=$(echo "$START_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadId',''))" 2>/dev/null || echo "")
 
-          HTTP_CODE=$(echo "$UPLOAD_RESP" | tail -1)
-          BODY=$(echo "$UPLOAD_RESP" | head -1)
-          echo "Upload response: HTTP $HTTP_CODE — $BODY"
+          if [ -z "$UPLOAD_ID" ]; then
+            echo "ERROR: Failed to start multipart upload: $START_RESP"
+            exit 1
+          fi
+          echo "Multipart upload started: $UPLOAD_ID"
 
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "ERROR: ISO upload failed with HTTP $HTTP_CODE"
-            curl -s -X POST "${{ inputs.api_url }}/api/build/${{ inputs.job_id }}/progress" \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer ${{ secrets.BUILD_SECRET }}" \
-              -d "{\"status\": \"failed\", \"log\": \"ISO upload to R2 failed: HTTP ${HTTP_CODE} — ${BODY}\"}"
+          # Step 2: Split and upload parts
+          split -b $CHUNK_SIZE -d "$ISO_FILE" /tmp/iso_part_
+          PARTS_JSON="["
+          PART_NUM=0
+          for PART_FILE in /tmp/iso_part_*; do
+            PART_NUM=$((PART_NUM + 1))
+            PART_SIZE=$(stat -c%s "$PART_FILE")
+            echo "Uploading part $PART_NUM ($PART_SIZE bytes)..."
+
+            PART_RESP=$(curl -s -X PUT "$API_URL/api/build/$JOB_ID/upload-iso/part" \
+              -H "Authorization: $AUTH" \
+              -H "Content-Type: application/octet-stream" \
+              -H "X-Upload-Id: $UPLOAD_ID" \
+              -H "X-Part-Number: $PART_NUM" \
+              --data-binary @"$PART_FILE")
+
+            ETAG=$(echo "$PART_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('etag',''))" 2>/dev/null || echo "")
+            if [ -z "$ETAG" ]; then
+              echo "ERROR: Part $PART_NUM upload failed: $PART_RESP"
+              exit 1
+            fi
+            echo "Part $PART_NUM uploaded, etag: $ETAG"
+
+            if [ $PART_NUM -gt 1 ]; then PARTS_JSON="$PARTS_JSON,"; fi
+            PARTS_JSON="$PARTS_JSON{\"partNumber\":$PART_NUM,\"etag\":\"$ETAG\"}"
+            rm -f "$PART_FILE"
+          done
+          PARTS_JSON="$PARTS_JSON]"
+
+          # Step 3: Complete multipart upload
+          COMPLETE_BODY="{\"uploadId\":\"$UPLOAD_ID\",\"parts\":$PARTS_JSON,\"sha256\":\"$ISO_SHA\",\"size\":$ISO_SIZE}"
+          COMPLETE_RESP=$(curl -s -X POST "$API_URL/api/build/$JOB_ID/upload-iso/complete" \
+            -H "Authorization: $AUTH" \
+            -H "Content-Type: application/json" \
+            -d "$COMPLETE_BODY")
+
+          echo "Complete response: $COMPLETE_RESP"
+          OK=$(echo "$COMPLETE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok',False))" 2>/dev/null || echo "")
+          if [ "$OK" != "True" ]; then
+            echo "ERROR: Multipart complete failed: $COMPLETE_RESP"
             exit 1
           fi
 
-          echo "ISO uploaded to R2 successfully"
-          # Wait for KV to propagate before reporting complete
+          echo "ISO uploaded to R2 successfully via multipart upload"
           sleep 2
 
       - name: Report complete
