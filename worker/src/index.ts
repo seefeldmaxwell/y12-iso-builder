@@ -869,8 +869,9 @@ function generateDockerfile(manifest: any, kernelConfig: string): string {
     '',
   ];
 
-  // Install linux-firmware + mode packages + overlay packages via chroot
-  const allChrootPkgs = ['linux-firmware', 'zstd', ...chrootPkgs].filter(p => p);
+  // Install firmware + mode packages + overlay packages via chroot
+  // Debian 12 uses firmware-linux-free (main) + firmware-misc-nonfree (non-free-firmware)
+  const allChrootPkgs = ['firmware-linux-free', 'firmware-misc-nonfree', 'zstd', ...chrootPkgs].filter(p => p);
   lines.push(
     '# Install firmware + mode-specific + overlay packages via chroot',
     `RUN chroot /rootfs /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${allChrootPkgs.join(' ')} && rm -rf /var/lib/apt/lists/*"`,
